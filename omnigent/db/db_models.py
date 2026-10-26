@@ -22,6 +22,8 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
     UniqueConstraint,
+    cast,
+    column,
     false,
     func,
     text,
@@ -683,6 +685,9 @@ class SqlConversationMetadata(OmnigentBase):
         ),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
+        Index(
+            "ix_conversation_metadata_runner_host", "workspace_id", "runner_id", "host_id", "id"
+        ),
         Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
@@ -1359,6 +1364,25 @@ class SqlHost(OmnigentBase):
             "terminating_sandbox_id",
             "workspace_id",
             "host_id",
+        ),
+    )
+
+
+class SqlSandboxProfileBinding(OmnigentBase):
+    """Immutable accepted provider reference for one session and its host."""
+
+    __tablename__ = "sandbox_profile_bindings"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    snapshot_json: Mapped[bytes] = mapped_column(LargeBinary(16383), nullable=False)
+
+    __table_args__ = (
+        Index("ix_sandbox_profile_bindings_host", "workspace_id", "host_id", "session_id"),
+        CheckConstraint(
+            func.length(cast(column("snapshot_json"), LargeBinary)) <= 16383,
+            name="ck_sandbox_profile_bindings_snapshot_bytes",
         ),
     )
 
