@@ -1,4 +1,11 @@
 import { testAgent } from "@/test/agentFixtures";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
+}));
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -1194,6 +1201,11 @@ function mockModelQueries(
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
+  vi.mocked(fetchSandboxProfiles).mockReset().mockResolvedValue({
+    profiles: [],
+    managed_providers: [],
+    next_cursor: null,
+  });
   getCurrentUserIdMock.mockReset();
   getCurrentUserIdMock.mockReturnValue(null);
   resolveIdentityMock.mockReset();
@@ -1592,6 +1604,7 @@ async function submitAndReadBody(
   fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
     target: { value: prompt },
   });
+  await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
   fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
   return readCreateBody();
 }
@@ -8211,6 +8224,7 @@ describe("NewChatLandingScreen", () => {
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "audit the repo" },
       });
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
       await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
       const [, init] = authenticatedFetchMock.mock.calls[0];
@@ -8353,6 +8367,272 @@ describe("NewChatLandingScreen", () => {
     expect(body.workspaces).toEqual([]);
   });
 
+  it.each([false, undefined, "provider-opt-out"])(
+    "uses only selections advertised by the server and provider (%s)",
+    async (enabled) => {
+      const profile = {
+        id: "large",
+        name: "Large workspace",
+        description: "For builds",
+        provider: "agent_sandbox",
+        revision: "revision-1",
+      };
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+        profiles: [profile, { ...profile, id: "other", name: "Other provider", provider: "modal" }],
+        managed_providers: ["agent_sandbox", "modal"],
+        next_cursor: null,
+      });
+      authenticatedFetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ id: "conv_profile" })),
+      );
+      renderLanding({
+        features: { sandbox_profiles: true },
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_providers: ["agent_sandbox"],
+      });
+      fireEvent.pointerDown(
+        await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+        {
+          button: 0,
+        },
+      );
+      expect(screen.queryByText("Disabled profile")).toBeNull();
+      expect(screen.queryByText("Other provider")).toBeNull();
+      fireEvent.click(screen.getByText("Large workspace"));
+      cleanup();
+      vi.mocked(fetchSandboxProfiles).mockClear();
+      if (enabled === "provider-opt-out") {
+        vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+          profiles: [],
+          managed_providers: [],
+          next_cursor: null,
+        });
+      }
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_providers: ["agent_sandbox"],
+        features: enabled === undefined ? {} : { sandbox_profiles: enabled === "provider-opt-out" },
+      });
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: /Sandbox profile:/ })).toBeNull(),
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build the project" },
+      });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const body = JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string);
+      expect(body.host_type).toBe("managed");
+      expect(body).not.toHaveProperty("sandbox_profile_id");
+      expect(body).not.toHaveProperty("sandbox_profile_revision");
+      if (enabled === "provider-opt-out")
+        expect(fetchSandboxProfiles).toHaveBeenCalledWith("agent_sandbox");
+      else expect(fetchSandboxProfiles).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "launches with an explicit profile revision (attachments=%s)",
+    async (attachments) => {
+      const profile = {
+        id: "large",
+        name: "Large workspace",
+        description: "For builds",
+        provider: "agent_sandbox",
+        revision: "revision-1",
+      };
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+        profiles: [profile, { ...profile, id: "other", name: "Other provider", provider: "modal" }],
+        managed_providers: ["agent_sandbox", "modal"],
+        next_cursor: null,
+      });
+      authenticatedFetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ id: "conv_profile" })),
+      );
+      renderLanding({
+        features: { sandbox_profiles: true },
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_providers: ["agent_sandbox", "modal"],
+        durable_initial_input: attachments,
+      });
+      const picker = await screen.findByRole("button", {
+        name: "Sandbox profile: Choose profile",
+      });
+      expect(fetchSandboxProfiles).toHaveBeenCalledWith("agent_sandbox");
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build the project" },
+      });
+      expect(screen.getByText("Choose a sandbox profile to continue.")).toBeVisible();
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      fireEvent.pointerDown(picker, {
+        button: 0,
+      });
+      expect(screen.queryByRole("menuitem", { name: /^Default/ })).toBeNull();
+      expect(screen.queryByText("Disabled profile")).toBeNull();
+      expect(screen.queryByText("Other provider")).toBeNull();
+      fireEvent.click(screen.getByText("Large workspace"));
+      if (!attachments) {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-modal"));
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+        fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+        expect(authenticatedFetchMock).not.toHaveBeenCalled();
+        expect(
+          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+        ).toBeVisible();
+        expect(fetchSandboxProfiles).toHaveBeenCalledWith("modal");
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+        fireEvent.pointerDown(
+          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+          { button: 0 },
+        );
+        fireEvent.click(screen.getByText("Large workspace"));
+      }
+      const file = new File(["build context"], "context.txt", { type: "text/plain" });
+      if (attachments)
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [file] },
+        });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const request = authenticatedFetchMock.mock.calls[0][1]!;
+      const body = JSON.parse(
+        attachments
+          ? ((request.body as FormData).get("metadata") as string)
+          : (request.body as string),
+      );
+      if (attachments) expect((request.body as FormData).getAll("initial_files")).toEqual([file]);
+      expect(body).toMatchObject({
+        host_type: "managed",
+        sandbox_provider: "agent_sandbox",
+        sandbox_profile_id: "large",
+        sandbox_profile_revision: "revision-1",
+      });
+    },
+  );
+
+  it.each([403, 409])(
+    "refreshes rejected profile choices after HTTP %s without silently reselecting",
+    async (status) => {
+      const profile = {
+        id: "large",
+        name: "Large workspace",
+        description: "",
+        provider: "agent_sandbox",
+        config: {},
+        revision: "revision-1",
+        enabled: true,
+        managed: true,
+      };
+      const catalog = {
+        profiles: [profile],
+        managed_providers: ["agent_sandbox"],
+        next_cursor: null,
+      };
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue(catalog);
+      authenticatedFetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Choose a sandbox profile again." }), { status }),
+      );
+      renderLanding({
+        features: { sandbox_profiles: true },
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+      });
+      fireEvent.pointerDown(
+        await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+        { button: 0 },
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Large workspace" }));
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build" },
+      });
+      const refreshed = {
+        ...profile,
+        id: status === 403 ? "replacement" : profile.id,
+        revision: "revision-2",
+      };
+      let resolveCatalog!: (value: typeof catalog) => void;
+      vi.mocked(fetchSandboxProfiles).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveCatalog = resolve;
+          }),
+      );
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(fetchSandboxProfiles).toHaveBeenCalledTimes(2));
+      expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+        "Choose a sandbox profile again.",
+      );
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      resolveCatalog({ ...catalog, profiles: [refreshed] });
+      await screen.findByText(
+        "This profile changed or is unavailable. Choose a profile again before launching.",
+      );
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("build");
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+      fireEvent.pointerDown(
+        screen.getByRole("button", { name: "Sandbox profile: Large workspace" }),
+        { button: 0 },
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Large workspace" }));
+      authenticatedFetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "conv_profile" })),
+      );
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+      expect(JSON.parse(authenticatedFetchMock.mock.calls[1][1]!.body as string)).toMatchObject({
+        sandbox_provider: "agent_sandbox",
+        sandbox_profile_id: refreshed.id,
+        sandbox_profile_revision: "revision-2",
+      });
+    },
+  );
+
+  it.each(["loading", "error", "empty"])(
+    "blocks sandbox launches while the profile catalog is %s",
+    async (state) => {
+      if (state === "loading")
+        vi.mocked(fetchSandboxProfiles).mockImplementation(() => new Promise(() => {}));
+      else if (state === "error")
+        vi.mocked(fetchSandboxProfiles).mockRejectedValue(new Error("Unavailable"));
+      else
+        vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+          profiles: [],
+          managed_providers: ["agent_sandbox"],
+          next_cursor: null,
+        });
+      renderLanding({
+        features: { sandbox_profiles: true },
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+      });
+      const label =
+        state === "loading"
+          ? "Loading profiles…"
+          : state === "error"
+            ? "Profiles unavailable"
+            : "No profiles available";
+      await screen.findByRole("button", { name: `Sandbox profile: ${label}` });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build" },
+      });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    },
+  );
+
   it("carries the picked provider in the managed create when several are offered", async () => {
     // A multi-provider server renders one row per provider. Picking the
     // second (non-default) row must ride into the POST as sandbox_provider,
@@ -8371,6 +8651,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "audit the repo" },
     });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
@@ -12140,7 +12421,7 @@ describe("managed sandbox gateway preview", () => {
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
   });
 
-  it("waits for the selected harness's catalog without probing a host", () => {
+  it("waits for the selected harness's catalog without probing a host", async () => {
     mockHosts([]);
     localStorage.setItem(LAST_AGENT_KEY, "a2");
     vi.mocked(useSandboxModelOptions).mockReturnValue({
@@ -12166,7 +12447,7 @@ describe("managed sandbox gateway preview", () => {
     openAgentModels("a2");
     expect(screen.getByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeVisible();
     closeMenu();
-    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
   });
 
   it("changes catalogs and efforts when switching Codex, Claude Code, and Polly", async () => {

@@ -28,6 +28,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import {
+  SandboxProfilePicker,
+  useSandboxProfileCatalog,
+  type SandboxProfileSelection,
+} from "@/components/SandboxProfilePicker";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
@@ -112,11 +118,12 @@ const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 const NO_HOSTS: Host[] = [];
 
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
-type ForkField = "host" | "directory" | "sandboxRepo";
+type ForkField = "host" | "directory" | "sandboxRepo" | "sandboxProfile";
 const FORK_FIELD_IDS: Record<ForkField, string> = {
   host: "fork-session-host",
   directory: "fork-session-directory",
   sandboxRepo: "fork-session-sandbox-repo",
+  sandboxProfile: "fork-session-sandbox-profile",
 };
 
 function ForkFieldError({ message }: { message: string | null }) {
@@ -822,6 +829,7 @@ function SupportedForkSessionForm({
   const [sandboxSelected, setSandboxSelected] = useState(false);
   // Provider the sandbox pick launches on; null for a server that names none.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfileSelection | null>(null);
   // Repository cloned into the sandbox, split across two inputs and
   // recomposed into the request's `<url>[#<branch>]` workspace.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState("");
@@ -1110,6 +1118,8 @@ function SupportedForkSessionForm({
   // picked yet) and whether it clones several repos.
   const forkEffectiveProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
+    useSandboxProfileCatalog(sandboxSelected ? forkEffectiveProvider : null, sandboxProfile);
   const forkProviderMultiRepo =
     info !== "loading" &&
     forkEffectiveProvider !== null &&
@@ -1126,6 +1136,9 @@ function SupportedForkSessionForm({
   // (the server provisions both), only a coherent repository.
   const submitBlocker = ((): { field: ForkField; message: string } | null => {
     if (sandboxSelected) {
+      if (sandboxProfileError !== null) {
+        return { field: "sandboxProfile", message: sandboxProfileError };
+      }
       // A multi-repo source inherits every repo, so it needs a multi-repo
       // destination; a single-repo provider would reject it after the fork exists.
       if (multiRepoSource) {
@@ -1258,6 +1271,7 @@ function SupportedForkSessionForm({
 
   /** Target the clone at a server-provisioned sandbox on `provider`. */
   function selectSandbox(provider: string | null): void {
+    if (provider !== sandboxProvider) setSandboxProfile(null);
     setSandboxSelected(true);
     setSandboxProvider(provider);
     // A host directory can't describe a sandbox that doesn't exist yet;
@@ -1332,7 +1346,13 @@ function SupportedForkSessionForm({
         // is the user's answer, including "blank" for an empty sandbox.
         sandbox: sandboxSelected
           ? {
-              provider: sandboxProvider,
+              provider: forkEffectiveProvider,
+              ...(selectedSandboxProfile !== null
+                ? {
+                    profileId: selectedSandboxProfile.id,
+                    profileRevision: selectedSandboxProfile.revision,
+                  }
+                : {}),
               // Omit the workspace for a multi-repo source so the server
               // inherits ALL of the source's repositories; otherwise send the
               // single repo the fields resolve to (blank → empty sandbox).
@@ -1401,6 +1421,9 @@ function SupportedForkSessionForm({
       navigate(`/c/${fork.id}`);
     } catch (e) {
       // forkSession failed — nothing created, so inputs stay editable for a resubmit.
+      if (sandboxSelected) {
+        void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+      }
       setError(e instanceof Error ? e.message : "Couldn't clone the session. Try again.");
     } finally {
       setSubmitting(false);
@@ -1722,6 +1745,22 @@ function SupportedForkSessionForm({
             selectedHostId={isCodingSource ? selectedHostId : (sourceHostId ?? null)}
             onChange={setRunConfig}
           />
+        )}
+
+        {sandboxSelected && forkEffectiveProvider !== null && (
+          <div className="flex flex-col gap-1">
+            <SandboxProfilePicker
+              id={FORK_FIELD_IDS.sandboxProfile}
+              provider={forkEffectiveProvider}
+              value={sandboxProfile}
+              onChange={setSandboxProfile}
+            />
+            {sandboxProfileError !== null && (
+              <p role="status" className="text-sm text-muted-foreground">
+                {sandboxProfileError}
+              </p>
+            )}
+          </div>
         )}
 
         {/* Sandbox counterpart of the reuse-dir indicator: the clone gets a

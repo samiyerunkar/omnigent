@@ -58,6 +58,7 @@ export interface Branding {
 
 /** Release features understood by this frontend build. */
 export type FeatureKey =
+  | "sandbox_profiles"
   | "usage_page"
   | "harness_install"
   | "canvas"
@@ -361,6 +362,14 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
   return info !== "loading" && info.features?.[feature] === true;
+}
+
+export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "sandbox_profiles") &&
+    info !== "loading" &&
+    info.managed_sandboxes_enabled
+  );
 }
 
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
