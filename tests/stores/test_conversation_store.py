@@ -3680,6 +3680,47 @@ def test_runner_session_status_page_uses_runner_index(
     assert "TEMP B-TREE" not in description, description
 
 
+@pytest.mark.parametrize("host_count", [0, 1, 3])
+def test_runner_host_lookup_is_bounded(
+    conversation_store: SqlAlchemyConversationStore, host_count: int
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    hosts = [f"{value:032x}" for value in range(1, host_count + 1)]
+    for host_id in [None, *hosts]:
+        for _ in range(4):
+            conv = conversation_store.create_conversation(runner_id="runner-target")
+            if host_id is not None:
+                conversation_store.set_host_id(conv.id, host_id, "/workspace")
+    other = conversation_store.create_conversation(runner_id="runner-other")
+    conversation_store.set_host_id(other.id, "f" * 32, "/workspace")
+    with workspace_scope(424242):
+        other = conversation_store.create_conversation(runner_id="runner-target")
+        conversation_store.set_host_id(other.id, "e" * 32, "/workspace")
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        assert conversation_store.get_runner_host_ids("runner-target") == hosts[:2]
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(queries) == (2 if hosts else 1)
+    assert all("LIMIT" in statement for statement, _ in queries)
+    if conversation_store._engine.dialect.name == "sqlite":
+        with conversation_store._engine.connect() as connection:
+            for statement, parameters in queries:
+                plan = str(
+                    connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+                )
+                assert "ix_conversation_metadata_runner_host" in plan, plan
+                assert "host_id>?" in "".join(plan.split()), plan
+                assert "TEMP B-TREE" not in plan, plan
+
+
 def test_list_conversations_by_runner_id_filters(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3749,6 +3790,146 @@ def _register_host(db_uri: str, host_id: str) -> None:
     :param host_id: Host identifier to register, e.g. ``"4f64b6ee625f4e8259185c35c6e63f3d"``.
     """
     HostStore(db_uri).upsert_on_connect(host_id, f"laptop-{host_id}", RESERVED_USER_LOCAL)
+
+
+@pytest.mark.parametrize("keep_hostless", [False, True])
+def test_reassign_runner_with_host_copies_trusted_binding(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, keep_hostless: bool
+) -> None:
+    store = conversation_store
+    host_id = "a" * 32
+    _register_host(db_uri, host_id)
+    for _ in range(2):
+        store.create_conversation(
+            runner_id="runner-trusted",
+            host_id=host_id,
+            workspace="/trusted/worktree",
+            git_branch="feature/trusted",
+        )
+    target = store.create_conversation(workspace="/caller/path", git_branch="caller-branch")
+    queries = []
+
+    def capture(_connection, _cursor, statement, parameters, _context, _executemany):
+        if (
+            statement.lstrip().upper().startswith("SELECT")
+            and "omnigent_conversation_metadata.runner_id =" in statement
+        ):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.reassign_runner_with_host(
+            target.id,
+            host_id,
+            "runner-trusted",
+            expected_runner_id=None,
+            keep_hostless=keep_hostless,
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+
+    saved = store.get_conversation(target.id)
+    assert saved.runner_id == "runner-trusted"
+    if keep_hostless:
+        assert (saved.host_id, saved.workspace, saved.git_branch) == (
+            None,
+            "/caller/path",
+            "caller-branch",
+        )
+    else:
+        assert (saved.host_id, saved.workspace, saved.git_branch) == (
+            host_id,
+            "/trusted/worktree",
+            "feature/trusted",
+        )
+
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    assert "LIMIT" in statement.upper()
+    with store._engine.connect() as connection:
+        assert len(connection.exec_driver_sql(statement, parameters).all()) == 1
+        if store._engine.dialect.name == "sqlite":
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            assert "ix_conversation_metadata_runner_host" in plan, plan
+            assert "workspace_id=? AND runner_id=? AND host_id=?" in plan, plan
+            assert "SCAN" not in plan, plan
+            assert "TEMP B-TREE" not in plan, plan
+
+
+def test_reassign_runner_with_host_rejects_stale_expected_runner(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    store = conversation_store
+    host_id = "a" * 32
+    _register_host(db_uri, host_id)
+    store.create_conversation(
+        runner_id="runner-replacement",
+        host_id=host_id,
+        workspace="/trusted/worktree",
+        git_branch="feature/trusted",
+    )
+    target = store.create_conversation(
+        runner_id="runner-current", workspace="/original/path", git_branch="original-branch"
+    )
+
+    with pytest.raises(ValueError, match="session binding changed"):
+        store.reassign_runner_with_host(
+            target.id, host_id, "runner-replacement", expected_runner_id="runner-stale"
+        )
+
+    saved = store.get_conversation(target.id)
+    assert (saved.runner_id, saved.host_id, saved.workspace, saved.git_branch) == (
+        "runner-current",
+        None,
+        "/original/path",
+        "original-branch",
+    )
+
+
+def test_reassign_runner_with_host_concurrent_detaches_keep_one_direct_binding(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from omnigent.db.db_models import current_workspace_id, workspace_scope
+
+    store = conversation_store
+    host_id, runner_id = "a" * 32, "runner-shared"
+    workspace_id = current_workspace_id()
+    _register_host(db_uri, host_id)
+    sessions = [
+        store.create_conversation(runner_id=runner_id, host_id=host_id, workspace="/trusted")
+        for _ in range(2)
+    ]
+    store.create_conversation(runner_id=runner_id)
+    ready = Barrier(2, timeout=10)
+
+    def detach(session_id: str) -> str | None:
+        with workspace_scope(workspace_id):
+            ready.wait()
+            try:
+                store.reassign_runner_with_host(
+                    session_id, host_id, None, expected_runner_id=runner_id
+                )
+            except ValueError as error:
+                return str(error)
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(detach, [session.id for session in sessions]))
+
+    assert outcomes.count(None) == 1
+    assert [outcome for outcome in outcomes if outcome is not None] == [
+        "Bind the replacement session before detaching the managed runner"
+    ]
+    saved = [store.get_conversation(session.id) for session in sessions]
+    assert sum(session.runner_id == runner_id for session in saved) == 1
+    assert sum(session.runner_id is None for session in saved) == 1
+    assert all(session.host_id == host_id for session in saved)
+    assert store.get_runner_host_ids(runner_id) == [host_id]
 
 
 def test_host_id_defaults_to_none(
@@ -8526,3 +8707,85 @@ def test_get_conversation_keeps_distinct_query_names(
         "omnigent.conversation_store.select_conversation_metadata_by_id",
         "omnigent.conversation_store.select_conversation_labels",
     ], names
+
+
+@pytest.mark.parametrize("operation", ["clear", "replace"])
+@pytest.mark.parametrize("changed", [None, "runner", "host"])
+def test_runner_write_checks_expected_binding(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    operation: str,
+    changed: str | None,
+) -> None:
+    store = conversation_store
+    before = store.create_conversation(runner_id="original-runner", workspace="/original")
+    if changed == "runner":
+        store.replace_runner_id(before.id, "newer-runner")
+    elif changed == "host":
+        _register_host(db_uri, "a" * 32)
+        store.set_host_id(before.id, "a" * 32)
+    current = store.get_conversation(before.id)
+
+    def write():
+        if operation == "clear":
+            return store.clear_runner_id(before.id, expected_binding=before)
+        return store.replace_runner_id(before.id, "replacement-runner", expected_binding=before)
+
+    if changed is not None:
+        with pytest.raises(ValueError, match="binding changed"):
+            write()
+        assert store.get_conversation(before.id) == current
+    else:
+        saved = write()
+        assert saved.runner_id == (None if operation == "clear" else "replacement-runner")
+        assert saved.host_id == before.host_id
+        assert saved.updated_at == before.updated_at
+
+
+@pytest.mark.parametrize(
+    "binding_state", ["missing", "matching", "profile_conflict", "host_conflict"]
+)
+def test_reassign_runner_accepts_profile_and_host_atomically(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, binding_state: str
+) -> None:
+    from omnigent.stores.sandbox_profile_store import SandboxProfileStore
+
+    store = conversation_store
+    profiles = SandboxProfileStore(store._engine)
+    host_id = "a" * 32
+    _register_host(db_uri, host_id)
+    store.create_conversation(runner_id="profile-runner", host_id=host_id, workspace="/trusted")
+    target = store.create_conversation()
+    snapshot = {"id": "build", "revision": "accepted"}
+    if binding_state != "missing":
+        profiles.bind_session(
+            target.id,
+            {**snapshot, "revision": "other"} if binding_state == "profile_conflict" else snapshot,
+        )
+    if binding_state == "host_conflict":
+        profiles.bind_host(target.id, "b" * 32)
+    before_profile = profiles.get_session_snapshot(target.id)
+    before_host = profiles.get_session_host_id(target.id)
+
+    def rotate():
+        store.reassign_runner_with_host(
+            target.id,
+            host_id,
+            "profile-runner",
+            expected_runner_id=None,
+            profile_snapshot=snapshot,
+        )
+
+    if binding_state.endswith("conflict"):
+        with pytest.raises(ValueError, match="cannot be"):
+            rotate()
+        assert store.get_conversation(target.id) == target
+        assert profiles.get_session_snapshot(target.id) == before_profile
+        assert profiles.get_session_host_id(target.id) == before_host
+    else:
+        rotate()
+        saved = store.get_conversation(target.id)
+        assert saved is not None and saved.runner_id == "profile-runner"
+        assert saved.host_id == host_id and saved.workspace == "/trusted"
+        assert profiles.get_session_snapshot(target.id) == snapshot
+        assert profiles.get_session_host_id(target.id) == host_id

@@ -42,8 +42,10 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlHost,
     SqlPolicy,
     SqlProject,
+    SqlSandboxProfileBinding,
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
@@ -117,6 +119,7 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
+from omnigent.stores.sandbox_profile_store import encode_snapshot
 
 _logger = logging.getLogger(__name__)
 
@@ -4110,7 +4113,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
     def replace_runner_id(
-        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+        self,
+        conversation_id: str,
+        runner_id: str,
+        *,
+        expected_runner_id: str | None = None,
+        expected_binding: Conversation | None = None,
     ) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
@@ -4129,11 +4137,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=expected_binding is not None,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_binding is not None and (
+                meta.runner_id != expected_binding.runner_id
+                or meta.host_id != expected_binding.host_id
+            ):
+                raise ValueError("The session binding changed; retry the request")
             if expected_runner_id is None:
                 meta.runner_id = runner_id
             else:
@@ -4159,7 +4176,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
-    def clear_runner_id(self, conversation_id: str) -> Conversation:
+    def clear_runner_id(
+        self, conversation_id: str, *, expected_binding: Conversation | None = None
+    ) -> Conversation:
         """
         Null out ``conversations.runner_id``. Atomic last-write-wins.
 
@@ -4171,11 +4190,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=expected_binding is not None,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_binding is not None and (
+                meta.runner_id != expected_binding.runner_id
+                or meta.host_id != expected_binding.host_id
+            ):
+                raise ValueError("The session binding changed; retry the request")
             meta.runner_id = None
             return meta
 
@@ -4189,7 +4217,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
-    def clear_host_binding(self, conversation_id: str) -> Conversation:
+    def clear_host_binding(
+        self, conversation_id: str, *, expected_host_id: str | None = None
+    ) -> Conversation:
         """
         NULL ``host_id``/``workspace``/``git_branch``/``runner_id`` together.
 
@@ -4200,17 +4230,28 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :returns: The updated :class:`Conversation`.
+        :param expected_host_id: When supplied, clear only if the current host
+            still matches this identity; otherwise leave every binding field unchanged.
+        :returns: The current :class:`Conversation` after the conditional clear.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
 
+        if expected_host_id is not None:
+            expected_host_id = uuid_to_bytes(expected_host_id).hex()
+
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_host_id is not None and meta.host_id != expected_host_id:
+                return meta
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None
@@ -4256,6 +4297,146 @@ class SqlAlchemyConversationStore(ConversationStore):
                 decoded = None
             statuses.append((session_id, decoded))
         return statuses
+
+    def get_runner_host_ids(self, runner_id: str) -> list[str]:
+        """Use at most two index seeks, skipping all sessions sharing the first host."""
+        host = SqlConversationMetadata.host_id
+        statement = (
+            select(host)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.runner_id == runner_id,
+                host.is_not(None),
+            )
+            .order_by(host, SqlConversationMetadata.id)
+            .limit(1)
+        )
+        with self._session("resolve_runner_host") as session:
+            first = session.scalar(statement)
+            if first is None:
+                return []
+            second = session.scalar(statement.where(host > first))
+            return [first] if second is None else [first, second]
+
+    def reassign_runner_with_host(
+        self,
+        conversation_id: str,
+        host_id: str,
+        runner_id: str | None,
+        *,
+        expected_runner_id: str | None,
+        keep_hostless: bool = False,
+        profile_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        """Serialize rotations on the host, retaining a directly bound runner session."""
+        host_id = uuid_to_bytes(host_id).hex()
+        encoded_profile = (
+            encode_snapshot(profile_snapshot) if profile_snapshot is not None else None
+        )
+
+        def write(session: Session) -> None:
+            host = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            if host is None:
+                raise ValueError("The runner's host is no longer available")
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if meta is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+            if meta.runner_id != expected_runner_id or meta.host_id not in (None, host_id):
+                raise ValueError("The session binding changed; retry the request")
+            # Only one excluded row can precede the first matching indexed source.
+            source = session.scalar(
+                select(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.runner_id == (runner_id or expected_runner_id),
+                    SqlConversationMetadata.host_id == host_id,
+                    SqlConversationMetadata.id != conversation_id,
+                )
+                .order_by(SqlConversationMetadata.id)
+                .limit(1)
+            )
+            if source is None:
+                raise ValueError(
+                    "Bind the replacement session before detaching the managed runner"
+                )
+            if encoded_profile is not None:
+                binding = session.get(
+                    SqlSandboxProfileBinding,
+                    (current_workspace_id(), conversation_id),
+                    with_for_update=True,
+                )
+                if binding is None:
+                    session.add(
+                        SqlSandboxProfileBinding(
+                            workspace_id=current_workspace_id(),
+                            session_id=conversation_id,
+                            host_id=host_id,
+                            snapshot_json=encoded_profile,
+                        )
+                    )
+                else:
+                    if binding.snapshot_json != encoded_profile:
+                        raise ValueError("A session's sandbox profile cannot be changed")
+                    if binding.host_id not in (None, host_id):
+                        raise ValueError("A profiled session cannot be moved to a different host")
+                    binding.host_id = host_id
+            if runner_id is not None and not keep_hostless:
+                meta.host_id = source.host_id
+                meta.workspace = source.workspace
+                meta.git_branch = source.git_branch
+            meta.runner_id = runner_id
+
+        run_write_transaction(self._session_immediate, "rotate_profiled_runner", write)
+
+    def rollback_runner_reassignment(
+        self,
+        previous: Conversation,
+        *,
+        expected_runner_id: str,
+        expected_host_id: str | None,
+    ) -> bool:
+        """Undo a failed rotation without erasing a newer binding or the last host link."""
+
+        def write(session: Session) -> bool:
+            if expected_host_id is not None:
+                session.get(
+                    SqlHost, (current_workspace_id(), expected_host_id), with_for_update=True
+                )
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), previous.id),
+                with_for_update=True,
+            )
+            if meta is None:
+                raise ConversationNotFoundError(f"conversation {previous.id!r} does not exist")
+            if meta.runner_id != expected_runner_id or meta.host_id != expected_host_id:
+                return False
+            if meta.host_id is not None:
+                source = session.scalar(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.runner_id == expected_runner_id,
+                        SqlConversationMetadata.host_id == expected_host_id,
+                        SqlConversationMetadata.id != previous.id,
+                    )
+                    .order_by(SqlConversationMetadata.id)
+                    .limit(1)
+                )
+                if source is None:
+                    return False
+            if previous.runner_id is not None:
+                meta.host_id = previous.host_id
+                meta.workspace = previous.workspace
+                meta.git_branch = previous.git_branch
+            meta.runner_id = previous.runner_id
+            return True
+
+        return run_write_transaction(self._session_immediate, "rollback_profiled_runner", write)
 
     def list_conversations_by_runner_id(
         self,
